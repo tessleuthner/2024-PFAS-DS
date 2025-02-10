@@ -1,0 +1,178 @@
+#easyXpress to calculate DRC
+
+#install 'easyXpress'
+install.packages("devtools")
+devtools::install_github("AndersenLab/easyXpress")
+
+#Load 'easyXpress' and other required packages
+library(tidyverse)
+library(tidyproject)
+library(easyXpress)
+library(tidyr)
+library(drc)
+library(gtools)
+library(utils)
+
+#Name the date of your experiment here
+#Set your path to the correct directory
+#Example:
+dirs <- rprojroot::find_package_root_file("/Dropbox (Duke Bio_Ea)/Baugh Lab/2_baugh_lab_users/ImageXpress/20230226_PFAS_out", "processed_data")
+datafile <- "20230226_PFAS_DS_R1_Analysis-20230305.RData"
+
+# Read in the data
+raw <- easyXpress::readXpress(filedir = dirs, rdafile = datafile, design = TRUE)
+
+#select models and remove edges
+model_selected <- easyXpress::modelSelection(raw)
+edge_flagged <- easyXpress::edgeFlag(model_selected, radius=900, center_x=1024, center_y=1024)
+raw_flagged <- easyXpress::setFlags(edge_flagged, cluster_flag = TRUE, well_edge_flag = TRUE)
+
+#save lists
+processed <- easyXpress::process(raw_flagged, Metadata_Plate, Metadata_Well)
+
+
+#Extract lengths and calculate means, and add any other statistics
+
+#Cut-off of 206 um
+processed_final <- subset(processed$processed_data, worm_length_um > 206)
+head(processed_final)
+
+processed_final$concentration_mm <- as.numeric(processed_final$concentration_mm)
+#summary(processed_final)
+
+#Calculate the average worm length per well (dose)
+mean_um <- processed_final %>% 
+  group_by(strain, drug, concentration_mm) %>% 
+  summarise(N    = length(worm_length_um),
+            mean = mean(worm_length_um),
+            sd   = sd(worm_length_um),
+            se   = sd / sqrt(N),
+            ci   = se * qt(0.95/2 + .5, N-1)) 
+
+
+#Arrange the order of the chemicals that you wish to plot if there are multiple chemicals, for example:
+mean_um$drug <- factor(mean_um$drug, levels = c("control", "PFOA", "PFOS", "PFNA", "PFOSA", "PFBA", "PFPeA", "PFBS", "PFBSA", "PFMOAA", "PFEESA", "GenX", "6:2 FTS", "6:2 FTCA"))
+
+
+#graph results
+#If concentrations are log10 transformed, here is the code to correctly label the x axis
+#x.expression <- expression(Log[10]~Dose ~ (µM))
+p <- ggplot(mean_um, aes(x=concentration_mm, y=mean))+
+  geom_errorbar(aes(ymin=mean-se, ymax=mean+se, color = strain), width=.01) +
+  #geom_line(aes(color=strain), size = 1) + 
+  #aes(geom_point(data = mean_um, aes(x = reorder(strain, mean))))+
+  #geom_point(data = mean_um, aes(x = reorder(strain, mean), y=mean, color = strain)) +
+  geom_point(aes(color=strain), size = 1)+
+  geom_line(aes(color=strain))+
+  labs(title="48 hr Growth Assay", x = "Dose (mM)",  y = "Length (µm)")+
+  theme_classic(base_size = 20) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        text = element_text(size=20), 
+        panel.background = element_rect(fill = "white"), 
+        axis.line.x = element_line(colour = "black", size = .5), 
+        axis.line.y = element_line(colour = "black", size = .5),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+
+p
+
+#Can facet by drug or strain, depending on your question:
+p + facet_wrap(.~drug)
+p + facet_wrap(.~drug, scales = "free_x")
+
+
+#######
+#Estimating EC50
+#This calculated an effective concentration in which there is 50% growth inhibition.
+#This can be modified to include or substitute to any EC value.
+# Set up dataframe for all drug/strain combinations
+
+#Make a drugList, for example these are the 10 PFAS chemicals I used in this study:
+#PFAS list
+drugList <- c("PFOS",
+              "PFOA",
+              "PFNA",
+              "PFBS",
+              "PFBA",
+              "PFPeA",
+              "PFOSA",
+              "PFBSA",
+              "GenX",
+              "PFEESA")
+#Make a strainList, for example these are the 12 strains I used in this study:              
+#Divergent set strain list
+strainList <- c("N2",
+                "CB4856",
+                "CX11314",
+                "DL238",
+                "ED3017",
+                "EG4725",
+                "JU258",
+                "JU775",
+                "JT11398",
+                "LKC34",
+                "MY16",
+                "MY23")
+                
+#Make the dataframe              
+ed_stats <- expand.grid(Strain = strainList, Drug = drugList)
+
+ED50 <- rep(NA, nrow(ed_stats))
+fit_pval  <- rep(NA, nrow(ed_stats))
+
+ed_stats <- cbind(ed_stats,
+                        ED50,
+                        fit_pval)
+
+ed_stats <- ed_stats %>% 
+  arrange(by_group = Strain)
+
+myplots <- rep(list(list()), nrow(ed_stats))
+
+for (i in 1:nrow(ed_stats)) {
+    sub_data <- processed_final %>% 
+      filter(processed_final$drug == ed_stats[i,"Drug"] & processed_final$strain == ed_stats[i,"Strain"])
+    
+    if(nrow(sub_data) == 0){
+      next
+    }else{
+      
+    
+    # fit the model
+    
+    # print the various effective doses ('ED')
+    sub_curve <- drm(worm_length_um ~ concentration_mm, data = sub_data, fct = LL.4(fixed=c(NA, 206, NA, NA),
+                                                                                names = c("Slope", "Lower Limit", "Upper Limit", "E50")))
+    
+    #This is a goodness of fit, so could that be printed for each strain/chemical, too? 
+    ed_stats[i,"fit_pval"] <- modelFit(sub_curve)[2,5]
+    
+    #message(i)
+    myplots[[i]] <- local({
+      i <- i
+      p1 <- "plot"(sub_curve, main = paste0(ed_stats[i,"Strain"],":",ed_stats[i,"Drug"]),
+                   type = "all",
+                   xlab = "concentration (mM)", 
+                   ylab = "worm length (um)")
+      print(p1)
+    })
+    
+    #print the various effective doses ('ED') 
+    subED <- as.data.frame(ED(sub_curve, c(50), interval = "delta"))
+    subED <- tibble::rownames_to_column(subED, "ED")
+    subED_flip <- data.frame(t(subED[-1]))
+    colnames(subED_flip) <- subED[, 1]
+    
+    ed_stats[i,3:5] <- subED_flip[1,1:3]
+    
+    #sub_plot <- ggplot(data = sub_curve, 
+    }
+    
+}
+
+
+#Save the results as a .csv
+write.csv(ed_stats, 'YYYYMMDD_[ExperimentName]_EC50.csv')
+
+
+
+
